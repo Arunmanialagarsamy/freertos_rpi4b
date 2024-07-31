@@ -36,6 +36,10 @@
 #define configMINIMAL_STACK_SIZE				( ( unsigned short ) 200 )
 #define configTOTAL_HEAP_SIZE					( 124 * 1024 )
 #define configUSE_16_BIT_TICKS					0
+#define configUSE_TRACE_FACILITY                                1
+#define configUSE_STATS_FORMATTING_FUNCTIONS                    2
+#define configSUPPORT_DYNAMIC_ALLOCATION                        1
+
 #define configIDLE_SHOULD_YIELD					1
 
 #define configUSE_MUTEXES						1
@@ -45,6 +49,9 @@
 #define configTIMER_TASK_PRIORITY				( configMAX_PRIORITIES - 1 )
 #define configTIMER_QUEUE_LENGTH				5
 #define configTIMER_TASK_STACK_DEPTH			( configMINIMAL_STACK_SIZE * 2 )
+
+
+#define configCOMMAND_INT_MAX_OUTPUT_SIZE 2096
 
 /* Set the following definitions to 1 to include the API function, or zero
 to exclude the API function. */

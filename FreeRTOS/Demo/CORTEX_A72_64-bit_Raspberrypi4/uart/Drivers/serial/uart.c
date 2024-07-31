@@ -81,13 +81,40 @@ uint32_t uart_read_bytes(uint8_t *buf, uint32_t length)
 }
 /*-----------------------------------------------------------*/
 
+unsigned char is_uart_tx_ready(void)
+{
+        // Read tx ready state using CHIP registers
+        return 0;
+}
+
+unsigned char is_uart_rx_ready(void)
+{
+        return (UART_FR & 1 << 6);
+}
+
+unsigned char get_uart_char_from_chip(void)
+{
+        return (uint8_t) 0xFF & UART_DR;
+}
+
+void put_uart_char_to_chip(uint8_t c)
+{
+	while ( UART_FR & (0x20) ) { }
+	UART_DR = c;
+}
+
 void uart_isr(void)
 {
+#if 0
     /* RX data */
     if( !(UART_FR & (0x1U << 4)) ) {
         uint8_t c = (uint8_t) 0xFF & UART_DR;
         xQueueSendToBackFromISR(uartctl->rx_queue, &c, NULL);
     }
+#else
+	 extern void vUSART_ISR( void );
+        vUSART_ISR();
+#endif
 }
 /*-----------------------------------------------------------*/
 
