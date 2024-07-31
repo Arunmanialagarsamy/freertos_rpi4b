@@ -11,7 +11,9 @@ CFLAGS = -mcpu=cortex-a72 \
          -I$(INCLUDEPATH2) \
          -I$(INCLUDEPATH3) \
          -I$(INCLUDEPATH4) \
-         -I$(INCLUDEPATH5)
+         -I$(INCLUDEPATH5) \
+         -I$(INCLUDEPATH6) \
+         -I$(INCLUDEPATH7)
 BUILTIN_OPS = -fno-builtin-memset
 ASMFLAGS = -mcpu=cortex-a72
 
@@ -20,6 +22,8 @@ INCLUDEPATH2 ?= ../musl_libc
 INCLUDEPATH3 ?= ../mmu
 INCLUDEPATH4 ?= ../../../Source/include
 INCLUDEPATH5 ?= ../../../Source/portable/GCC/ARM_CA72_64_BIT
+INCLUDEPATH6 ?= ../../../../FreeRTOS_Plus_Cli
+INCLUDEPATH7 ?= Drivers/serial
 
 # From ./src
 OBJS = build/startup.o 
@@ -29,6 +33,11 @@ OBJS +=build/interrupt.o
 OBJS +=build/main.o
 OBJS +=build/mmu_cfg.o
 OBJS +=build/uart.o
+OBJS +=build/uart_string.o
+OBJS +=build/Sample-CLI-commands.o
+OBJS +=build/UARTCommandConsole.o
+OBJS +=build/FreeRTOS_CLI.o
+OBJS +=build/serial.o
 
 # From ../mmu
 OBJS +=build/mmu.o
@@ -66,10 +75,12 @@ clean :
 	rm -rf ./build
 	rm -f *.elf
 	rm -f *.list
+	rm -f *.img
 
 uart.elf : src/raspberrypi4.ld $(OBJS)
 	$(CROSS)gcc -Wl,--build-id=none -std=gnu99 -T src/raspberrypi4.ld -o $@ -ffreestanding -nostdlib --specs=nosys.specs $(BUILTIN_OPS) $(OBJS)
 	$(CROSS)objdump -d uart.elf > uart.list
+	$(CROSS)objcopy -O binary uart.elf kernel8.img
 
 build/%.o : src/%.S
 	$(CROSS)as $(ASMFLAGS) -c -o $@ $<
@@ -87,6 +98,12 @@ build/%.o : ../musl_libc/%.c
 	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
 
 build/%.o : ../../../Source/%.c
+	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
+
+build/%.o : ../../../../FreeRTOS_Plus_Cli/%.c
+	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
+
+build/%.o : Drivers/serial/%.c
 	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
 
 build/%.o : ../../../Source/portable/GCC/ARM_CA72_64_BIT/%.c

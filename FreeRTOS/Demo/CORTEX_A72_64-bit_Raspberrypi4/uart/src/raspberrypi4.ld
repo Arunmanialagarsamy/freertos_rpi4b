@@ -1,10 +1,14 @@
-ENTRY(_boot)
-
+/*ENTRY(_boot)*/
+CODE_BASE   = 0x80000;
+DATA_BASE   = 0x400000;
+STACK_TOP   = 0x800000;
+PT_BASE     = 0x800000;
+/*
 CODE_BASE   = 0x20000000;
 DATA_BASE   = 0x20200000;
 STACK_TOP   = 0x20600000;
 PT_BASE     = 0x20600000;
- 
+ */
 SECTIONS
 {
     /* Starts at 0x20000000 (assuming ends at 0x208FFFFF, 9MB). */

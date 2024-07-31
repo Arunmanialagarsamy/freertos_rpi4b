@@ -8,5 +8,5 @@
 
 /* IRQ number */
 #define IRQ_VTIMER (27)
-#define IRQ_VC_UART (153)
+#define IRQ_VC_UART (125)
 

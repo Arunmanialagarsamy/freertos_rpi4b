@@ -36,8 +36,8 @@ start_el1:
     adrp    x1, stack_top
     mov     sp, x1
     // configure MMU
-    ldr     x0, =configure_mmu
-    blr     x0
+    //ldr     x0, =configure_mmu
+    //blr     x0
     // clear bss
     ldr     x1, =__bss_start
     ldr     w2, =__bss_size
