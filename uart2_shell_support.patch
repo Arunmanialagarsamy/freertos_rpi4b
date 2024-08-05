@@ -1,0 +1,2000 @@
+From 76d88a69fab13108f52265c88e62de6be51ff0fa Mon Sep 17 00:00:00 2001
+From: Arunmani Alagarsamy <arunmani.a@capgemini.com>
+Date: Wed, 31 Jul 2024 10:37:44 +0530
+Subject: [PATCH] Driver: uart_shell: Add UART-2 shell support for RPi-4B
+
+This commit adds echo and task-stats commands for UART-2 shell support on the
+Raspberry Pi 4B. These commands facilitate communication through the UART shell.
+
+Signed-off-by: Arunmani Alagarsamy <arunmani.a@capgemini.com>
+---
+ .../uart/Drivers/serial/UARTCommandConsole.c  | 261 ++++++++++
+ .../uart/Drivers/serial/serial.c              | 255 +++++++++
+ .../uart/Drivers/serial/serial.h              |  14 +
+ .../uart/{src => Drivers/serial}/uart.c       |  27 +
+ .../uart/{src => Drivers/serial}/uart.h       |   0
+ .../uart/Drivers/serial/uart_string.c         | 114 +++++
+ .../uart/Drivers/serial/uart_string.h         |  12 +
+ .../uart/Makefile                             |  19 +-
+ .../uart/src/FreeRTOSConfig.h                 |   7 +
+ .../uart/src/main.c                           |  58 +--
+ .../uart/src/raspberrypi4.ld                  |  10 +-
+ .../uart/src/startup.S                        |   4 +-
+ FreeRTOS/Source/tasks.c                       |  21 +-
+ FreeRTOS_Plus_Cli/FreeRTOS_CLI.c              | 351 +++++++++++++
+ FreeRTOS_Plus_Cli/FreeRTOS_CLI.h              |  92 ++++
+ FreeRTOS_Plus_Cli/Sample-CLI-commands.c       | 483 ++++++++++++++++++
+ 16 files changed, 1654 insertions(+), 74 deletions(-)
+ create mode 100644 FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/UARTCommandConsole.c
+ create mode 100644 FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.c
+ create mode 100644 FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.h
+ rename FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/{src => Drivers/serial}/uart.c (90%)
+ rename FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/{src => Drivers/serial}/uart.h (100%)
+ create mode 100644 FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.c
+ create mode 100644 FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.h
+ create mode 100644 FreeRTOS_Plus_Cli/FreeRTOS_CLI.c
+ create mode 100644 FreeRTOS_Plus_Cli/FreeRTOS_CLI.h
+ create mode 100644 FreeRTOS_Plus_Cli/Sample-CLI-commands.c
+
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/UARTCommandConsole.c b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/UARTCommandConsole.c
+new file mode 100644
+index 0000000..f9b4562
+--- /dev/null
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/UARTCommandConsole.c
+@@ -0,0 +1,261 @@
++/*
++ * FreeRTOS Kernel V10.2.1
++ * Copyright (C) 2017 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of
++ * this software and associated documentation files (the "Software"), to deal in
++ * the Software without restriction, including without limitation the rights to
++ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++ * the Software, and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * http://www.FreeRTOS.org
++ * http://aws.amazon.com/freertos
++ *
++ * 1 tab == 4 spaces!
++ */
++
++/*
++ * NOTE:  This file uses a third party USB CDC driver.
++ */
++
++/* FreeRTOS includes. */
++#include "FreeRTOS.h"
++#include "task.h"
++#include "semphr.h"
++
++#include "uart_string.h"
++
++/* Example includes. */
++#include "FreeRTOS_CLI.h"
++
++/* Demo application includes. */
++#include "serial.h"
++
++/* Dimensions the buffer into which input characters are placed. */
++#define cmdMAX_INPUT_SIZE               50
++
++/* Dimentions a buffer to be used by the UART driver, if the UART driver uses a
++   buffer at all. */
++#define cmdQUEUE_LENGTH                 25
++
++/* DEL acts as a backspace. */
++#define cmdASCII_DEL            ( 0x7F )
++
++/* The maximum time to wait for the mutex that guards the UART to become
++   available. */
++#define cmdMAX_MUTEX_WAIT               pdMS_TO_TICKS( 300 )
++
++#ifndef configCLI_BAUD_RATE
++#define configCLI_BAUD_RATE     115200
++#endif
++/*
++int my_strlen(const char *str);
++void my_strcpy(char *dest, const char *src);
++void my_memset(void *ptr, int value, int num);
++
++int my_strlen(const char *str) {
++    int length = 0;
++
++    while (*str != '\0') {
++        length++;
++        str++;
++    }
++
++    return length;
++}
++
++void my_strcpy(char *dest, const char *src) {
++    while ((*dest++ = *src++))
++        ;
++}
++
++void my_memset(void *ptr, int value, int num) {
++    unsigned char *p = ptr;
++    for (size_t i = 0; i < num; ++i) {
++        *p++ = (unsigned char)value;
++    }
++}
++
++*/
++/*-----------------------------------------------------------*/
++
++/*-----------------------------------------------------------*/
++
++/*
++ * The task that implements the command console processing.
++ */
++static void prvUARTCommandConsoleTask( void *pvParameters );
++void vUARTCommandConsoleStart( uint16_t usStackSize, UBaseType_t uxPriority );
++
++/*-----------------------------------------------------------*/
++
++/* Const messages output by the command console. */
++static const char * const pcWelcomeMessage = "FreeRTOS command server.\r\nType Help to view a list of registered commands.\r\n\r\n>";
++static const char * const pcEndOfOutputMessage = "\r\n[Press ENTER to execute the previous command again]\r\n>";
++static const char * const pcNewLine = "\r\n";
++
++/* Used to guard access to the UART in case messages are sent to the UART from
++   more than one task. */
++static SemaphoreHandle_t xTxMutex = NULL;
++
++/* The handle to the UART port, which is not used by all ports. */
++static xComPortHandle xPort = 0;
++
++/*-----------------------------------------------------------*/
++
++void vUARTCommandConsoleStart( uint16_t usStackSize, UBaseType_t uxPriority )
++{
++        /* Create the semaphore used to access the UART Tx. */
++        xTxMutex = xSemaphoreCreateMutex();
++        configASSERT( xTxMutex );
++
++        /* Create that task that handles the console itself. */
++        xTaskCreate(    prvUARTCommandConsoleTask,      /* The task that implements the command console. */
++                        "CLI",                                          /* Text name assigned to the task.  This is just to assist debugging.  The kernel does not use this name itself. */
++                        usStackSize,                            /* The size of the stack allocated to the task. */
++                        NULL,                                           /* The parameter is not used, so NULL is passed. */
++                        uxPriority,                                     /* The priority allocated to the task. */
++                        NULL );                                         /* A handle is not required, so just pass NULL. */
++}
++/*-----------------------------------------------------------*/
++
++static void prvUARTCommandConsoleTask( void *pvParameters )
++{
++        signed char cRxedChar;
++        uint8_t ucInputIndex = 0;
++        char *pcOutputString;
++        static char cInputString[ cmdMAX_INPUT_SIZE ], cLastInputString[ cmdMAX_INPUT_SIZE ];
++        BaseType_t xReturned;
++        xComPortHandle xPort;
++
++        ( void ) pvParameters;
++
++        /* Obtain the address of the output buffer.  Note there is no mutual
++           exclusion on this buffer as it is assumed only one command console interface
++           will be used at any one time. */
++        pcOutputString = FreeRTOS_CLIGetOutputBuffer();
++
++        /* Initialise the UART. */
++        xPort = xSerialPortInitMinimal( configCLI_BAUD_RATE, cmdQUEUE_LENGTH );
++
++        extern void vRegisterSampleCLICommands( void );
++
++        vRegisterSampleCLICommands();
++
++        extern void vRegisterUDPCLICommands( void );
++        vRegisterSampleCLICommands();
++
++
++        /* Send the welcome message. */
++        vSerialPutString( xPort, ( signed char * ) pcWelcomeMessage, ( unsigned short ) my_strlen( pcWelcomeMessage ) );
++	
++	        for( ;; )
++        {
++                /* Wait for the next character.  The while loop is used in case
++                   INCLUDE_vTaskSuspend is not set to 1 - in which case portMAX_DELAY will
++                   be a genuine block time rather than an infinite block time. */
++                while( xSerialGetChar( xPort, &cRxedChar, portMAX_DELAY ) != pdPASS );
++
++                /* Ensure exclusive access to the UART Tx. */
++                if( xSemaphoreTake( xTxMutex, cmdMAX_MUTEX_WAIT ) == pdPASS )
++                {
++                        /* Echo the character back. */
++                        xSerialPutChar( xPort, cRxedChar, portMAX_DELAY );
++
++                        /* Was it the end of the line? */
++                        if( cRxedChar == '\n' || cRxedChar == '\r' )
++                        {
++                                /* Just to space the output from the input. */
++                                vSerialPutString( xPort, ( signed char * ) pcNewLine, ( unsigned short ) my_strlen( pcNewLine ) );
++
++                                /* See if the command is empty, indicating that the last command
++                                   is to be executed again. */
++                                if( ucInputIndex == 0 )
++                                {
++                                        /* Copy the last command back into the input string. */
++                                        my_strcpy( cInputString, cLastInputString );
++                                }
++
++                                /* Pass the received command to the command interpreter.  The
++                                   command interpreter is called repeatedly until it returns
++                                   pdFALSE      (indicating there is no more output) as it might
++                                   generate more than one string. */
++                                do
++                                {
++                                        /* Get the next output string from the command interpreter. */
++                                        xReturned = FreeRTOS_CLIProcessCommand( cInputString, pcOutputString, configCOMMAND_INT_MAX_OUTPUT_SIZE );
++
++                                        /* Write the generated string to the UART. */
++                                        vSerialPutString( xPort, ( signed char * ) pcOutputString, ( unsigned short ) my_strlen( pcOutputString ) );
++
++                                } while( xReturned != pdFALSE );
++				/* All the strings generated by the input command have been
++                                   sent.  Clear the input string ready to receive the next command.
++                                   Remember the command that was just processed first in case it is
++                                   to be processed again. */
++                                my_strcpy( cLastInputString, cInputString );
++                                ucInputIndex = 0;
++                                my_memset( cInputString, 0x00, cmdMAX_INPUT_SIZE );
++
++                                vSerialPutString( xPort, ( signed char * ) pcEndOfOutputMessage, ( unsigned short ) my_strlen( pcEndOfOutputMessage ) );
++                        }
++			else
++                        {
++                                if( cRxedChar == '\r' )
++                                {
++                                        /* Ignore the character. */
++                                }
++                                else if( ( cRxedChar == '\b' ) || ( cRxedChar == cmdASCII_DEL ) )
++                                {
++                                        /* Backspace was pressed.  Erase the last character in the
++                                           string - if any. */
++                                        if( ucInputIndex > 0 )
++                                        {
++                                                ucInputIndex--;
++                                                cInputString[ ucInputIndex ] = '\0';
++                                        }
++                                }
++                                else
++                                {
++                                        /* A character was entered.  Add it to the string entered so
++                                           far.  When a \n is entered the complete      string will be
++                                           passed to the command interpreter. */
++                                        if( ( cRxedChar >= ' ' ) && ( cRxedChar <= '~' ) )
++                                        {
++                                                if( ucInputIndex < cmdMAX_INPUT_SIZE )
++                                                {
++                                                        cInputString[ ucInputIndex ] = cRxedChar;
++                                                        ucInputIndex++;
++                                                }
++                                        }
++                                }
++                        }
++
++                        /* Must ensure to give the mutex back. */
++                        xSemaphoreGive( xTxMutex );
++                }
++        }
++}
++/*-----------------------------------------------------------*/
++
++void vOutputString( const char * const pcMessage )
++{
++        if( xSemaphoreTake( xTxMutex, cmdMAX_MUTEX_WAIT ) == pdPASS )
++        {
++                vSerialPutString( xPort, ( signed char * ) pcMessage, ( unsigned short ) my_strlen( pcMessage ) );
++                xSemaphoreGive( xTxMutex );
++        }
++}
++
++
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.c b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.c
+new file mode 100644
+index 0000000..ec65347
+--- /dev/null
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.c
+@@ -0,0 +1,255 @@
++/*This file has been prepared for Doxygen automatic documentation generation.*/
++/* Copyright (c) 2009 Atmel Corporation. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright notice, this
++ * list of conditions and the following disclaimer.
++ *
++ * 2. Redistributions in binary form must reproduce the above copyright notice,
++ * this list of conditions and the following disclaimer in the documentation
++ * and/or other materials provided with the distribution.
++ *
++ * 3. The name of Atmel may not be used to endorse or promote products derived
++ * from this software without specific prior written permission.
++ *
++ * 4. This software may only be redistributed and used in connection with an Atmel
++ * AVR product.
++ *
++ * THIS SOFTWARE IS PROVIDED BY ATMEL "AS IS" AND ANY EXPRESS OR IMPLIED
++ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT ARE
++ * EXPRESSLY AND SPECIFICALLY DISCLAIMED. IN NO EVENT SHALL ATMEL BE LIABLE FOR
++ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
++ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
++ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
++ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
++ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE
++ *
++ */
++
++/* Scheduler includes. */
++#include "FreeRTOS.h"
++#include "queue.h"
++#include "task.h"
++
++/* Demo application includes. */
++#include "serial.h"
++
++#define IE_TXWM        (1 << 0)
++/*-----------------------------------------------------------*/
++
++#define serINVALID_COMPORT_HANDLER        ( ( xComPortHandle ) 0 )
++#define serINVALID_QUEUE                  ( ( xQueueHandle ) 0 )
++#define serHANDLE                         ( ( xComPortHandle ) 1 )
++#define serNO_BLOCK                       ( ( portTickType ) 0 )
++
++/*-----------------------------------------------------------*/
++
++/* Queues used to hold received characters, and characters waiting to be
++transmitted. */
++static xQueueHandle xRxedChars;
++static xQueueHandle xCharsForTx;
++
++/*-----------------------------------------------------------*/
++
++/* Forward declaration. */
++static void vprvSerialCreateQueues( unsigned portBASE_TYPE uxQueueLength,
++                                    xQueueHandle *pxRxedChars,
++                                    xQueueHandle *pxCharsForTx );
++
++static portBASE_TYPE prvUSART_ISR_NonNakedBehaviour( void )
++{
++        portBASE_TYPE xHigherPriorityTaskWoken = pdFALSE;
++        unsigned char cChar;
++        portBASE_TYPE retstatus;
++
++        extern unsigned char is_uart_rx_ready(void);
++        extern unsigned char get_uart_char_from_chip(void);
++
++        extern unsigned char is_uart_tx_ready(void);
++        extern void put_uart_char_to_chip(uint8_t c);
++
++	if (is_uart_tx_ready())
++        {
++                /* The interrupt was caused by the THR becoming empty.  Are there any
++                   more characters to transmit?
++                   Because FreeRTOS is not supposed to run with nested interrupts, put all OS
++                   calls in a critical section . */
++                portENTER_CRITICAL();
++                retstatus = xQueueReceiveFromISR( xCharsForTx, &cChar, &xHigherPriorityTaskWoken );
++                portEXIT_CRITICAL();
++
++                if (retstatus == pdTRUE)
++                {
++                        /* A character was retrieved from the queue so can be sent to the
++                           THR now. */
++                        put_uart_char_to_chip(cChar);
++                }
++                else
++                {
++                        /* Queue empty, nothing to send so turn off the Tx interrupt. */
++                }
++        }
++
++        if (is_uart_rx_ready())
++        {
++                /* The interrupt was caused by the receiver getting data. */
++                cChar = get_uart_char_from_chip();
++
++                /* Because FreeRTOS is not supposed to run with nested interrupts, put all OS
++                   calls in a critical section . */
++                portENTER_CRITICAL();
++                xQueueSendFromISR(xRxedChars, &cChar, &xHigherPriorityTaskWoken);
++                portEXIT_CRITICAL();
++        }
++
++        /* The return value will be used by portEXIT_SWITCHING_ISR() to know if it
++           should perform a vTaskSwitchContext(). */
++        return ( xHigherPriorityTaskWoken );
++}
++
++void vUSART_ISR( void )
++{
++#if 0
++    //portENTER_SWITCHING_ISR();
++#endif
++
++    prvUSART_ISR_NonNakedBehaviour();
++
++#if 0
++    //portEXIT_SWITCHING_ISR();
++#endif
++}
++/*-----------------------------------------------------------*/
++
++/*
++ * Init the serial port for the Minimal implementation.
++ */
++xComPortHandle xSerialPortInitMinimal( unsigned portLONG ulWantedBaud, unsigned portBASE_TYPE uxQueueLength )
++{
++        xComPortHandle    xReturn = serHANDLE;
++
++        /* Create the rx and tx queues. */
++        vprvSerialCreateQueues( uxQueueLength, &xRxedChars, &xCharsForTx );
++
++        /* Configure USART. */
++        if( ( xRxedChars != serINVALID_QUEUE ) &&
++                        ( xCharsForTx != serINVALID_QUEUE ) &&
++                        ( ulWantedBaud != ( unsigned portLONG ) 0 ) )
++        {
++                portENTER_CRITICAL();
++                {
++                        extern void uart_init(void);
++                        extern void uart_puts(const char* str);
++
++                        uart_init();
++
++                        uart_puts("Hello World !!!\r\n");
++                }
++                portEXIT_CRITICAL();
++        }
++        else
++        {
++                xReturn = serINVALID_COMPORT_HANDLER;
++        }
++
++        return xReturn;
++}
++/*-----------------------------------------------------------*/
++
++signed portBASE_TYPE xSerialGetChar( xComPortHandle pxPort, signed portCHAR *pcRxedChar, portTickType xBlockTime )
++{
++    /* The port handle is not required as this driver only supports UART0. */
++    ( void ) pxPort;
++
++    /* Get the next character from the buffer.  Return false if no characters
++    are available, or arrive before xBlockTime expires. */
++    if( xQueueReceive( xRxedChars, pcRxedChar, xBlockTime ) )
++    {
++        return pdTRUE;
++    }
++    else
++    {
++        return pdFALSE;
++    }
++}
++/*-----------------------------------------------------------*/
++
++void vSerialPutString( xComPortHandle pxPort, const signed portCHAR * const pcString, unsigned portSHORT usStringLength )
++{
++     signed portCHAR *pxNext;
++
++
++
++    /* NOTE: This implementation does not handle the queue being full as no
++    block time is used! */
++
++    /* The port handle is not required as this driver only supports UART0. */
++    ( void ) pxPort;
++    ( void ) usStringLength;
++
++    /* Send each character in the string, one at a time. */
++    pxNext = ( signed portCHAR * ) pcString;
++    while( *pxNext )
++    {
++        xSerialPutChar( pxPort, *pxNext, serNO_BLOCK );
++        pxNext++;
++    }
++}
++/*-----------------------------------------------------------*/
++
++signed portBASE_TYPE xSerialPutChar( xComPortHandle pxPort, signed portCHAR cOutChar, portTickType xBlockTime )
++{
++#if 0
++    /* Place the character in the queue of characters to be transmitted. */
++    if( xQueueSend( xCharsForTx, &cOutChar, xBlockTime ) != pdPASS )
++    {
++        return pdFAIL;
++    }
++
++    /* Turn on the Tx interrupt so the ISR will remove the character from the
++    queue and send it.   This does not need to be in a critical section as
++    if the interrupt has already removed the character the next interrupt
++    will simply turn off the Tx interrupt again. */
++    usart->ier = (1 << AVR32_USART_IER_TXRDY_OFFSET);
++
++    return pdPASS;
++#else
++    	( void ) pxPort;
++	( void ) xBlockTime;
++
++        extern void uart_putchar(uint8_t c);
++        uart_putchar(cOutChar);
++    	return pdPASS;
++#endif
++}
++/*-----------------------------------------------------------*/
++
++void vSerialClose( xComPortHandle xPort )
++{
++    	( void ) xPort;
++  /* Not supported as not required by the demo application. */
++}
++/*-----------------------------------------------------------*/
++
++/*###########################################################*/
++
++/*
++ * Create the rx and tx queues.
++ */
++static void vprvSerialCreateQueues(  unsigned portBASE_TYPE uxQueueLength, xQueueHandle *pxRxedChars, xQueueHandle *pxCharsForTx )
++{
++    /* Create the queues used to hold Rx and Tx characters. */
++    xRxedChars = xQueueCreate( uxQueueLength, ( unsigned portBASE_TYPE ) sizeof( signed portCHAR ) );
++    xCharsForTx = xQueueCreate( uxQueueLength + 1, ( unsigned portBASE_TYPE ) sizeof( signed portCHAR ) );
++
++    /* Pass back a reference to the queues so the serial API file can
++    post/receive characters. */
++    *pxRxedChars = xRxedChars;
++    *pxCharsForTx = xCharsForTx;
++}
++
++
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.h b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.h
+new file mode 100644
+index 0000000..c6648be
+--- /dev/null
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/serial.h
+@@ -0,0 +1,14 @@
++#ifndef SERIAL_COMMS_H
++#define SERIAL_COMMS_H
++
++typedef void * xComPortHandle;
++
++xComPortHandle xSerialPortInitMinimal( unsigned long ulWantedBaud, unsigned portBASE_TYPE uxQueueLength );
++void vSerialPutString( xComPortHandle pxPort, const signed char * const pcString, unsigned short usStringLength );
++signed portBASE_TYPE xSerialGetChar( xComPortHandle pxPort, signed char *pcRxedChar, portTickType xBlockTime );
++signed portBASE_TYPE xSerialPutChar( xComPortHandle pxPort, signed char cOutChar, portTickType xBlockTime );
++portBASE_TYPE xSerialWaitForSemaphore( xComPortHandle xPort );
++void vSerialClose( xComPortHandle xPort );
++
++#endif
++
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/uart.c b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart.c
+similarity index 90%
+rename from FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/uart.c
+rename to FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart.c
+index 5f32100..9ae2939 100644
+--- a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/uart.c
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart.c
+@@ -81,13 +81,40 @@ uint32_t uart_read_bytes(uint8_t *buf, uint32_t length)
+ }
+ /*-----------------------------------------------------------*/
+ 
++unsigned char is_uart_tx_ready(void)
++{
++        // Read tx ready state using CHIP registers
++        return 0;
++}
++
++unsigned char is_uart_rx_ready(void)
++{
++        return (UART_FR & 1 << 6);
++}
++
++unsigned char get_uart_char_from_chip(void)
++{
++        return (uint8_t) 0xFF & UART_DR;
++}
++
++void put_uart_char_to_chip(uint8_t c)
++{
++	while ( UART_FR & (0x20) ) { }
++	UART_DR = c;
++}
++
+ void uart_isr(void)
+ {
++#if 0
+     /* RX data */
+     if( !(UART_FR & (0x1U << 4)) ) {
+         uint8_t c = (uint8_t) 0xFF & UART_DR;
+         xQueueSendToBackFromISR(uartctl->rx_queue, &c, NULL);
+     }
++#else
++	 extern void vUSART_ISR( void );
++        vUSART_ISR();
++#endif
+ }
+ /*-----------------------------------------------------------*/
+ 
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/uart.h b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart.h
+similarity index 100%
+rename from FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/uart.h
+rename to FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart.h
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.c b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.c
+new file mode 100644
+index 0000000..37b1b12
+--- /dev/null
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.c
+@@ -0,0 +1,114 @@
++#include "uart_string.h"
++#include <stdarg.h>
++
++int my_strlen(const char *str) {
++    int length = 0;
++
++    // Loop until the null terminator is encountered
++    while (*str != '\0') {
++        length++;
++        str++;
++    }
++
++    return length;
++}
++
++void my_strcpy(char *dest, const char *src) {
++    while ((*dest++ = *src++))
++        ;
++}
++
++void my_memset(void *ptr, int value, int num) {
++    unsigned char *p = ptr;
++    for (int i = 0; i < num; ++i) {
++        *p++ = (unsigned char)value;
++    }
++}
++
++void my_strncpy(char *dest, const char *src, int n) {
++    int i;
++    for (i = 0; i < n && src[i] != '\0'; ++i) {
++        dest[i] = src[i];
++    }
++
++    for (; i < n; ++i) {
++        dest[i] = '\0';
++    }
++}
++
++int my_strncmp(const char *s1, const char *s2, int n) {
++    while (n-- > 0 && (*s1 || *s2)) {
++        if (*s1 != *s2)
++            return (*s1 - *s2);
++        if (*s1 == '\0' || *s2 == '\0')
++            break;
++        s1++;
++        s2++;
++    }
++    return 0;
++}
++
++
++char *my_strncat(char *dest, const char *src, int n) {
++    int dest_len = my_strlen(dest);
++    int i;
++
++    for (i = 0; i < n && src[i] != '\0'; i++)
++        dest[dest_len + i] = src[i];
++
++    dest[dest_len + i] = '\0';
++
++    return dest;
++}
++
++void my_sprintf(char *str, const char *format, ...) {
++    char *p = str;
++    va_list args;
++    va_start(args, format);
++
++    while (*format != '\0') {
++        if (*format == '%') {
++            format++;
++            switch (*format) {
++                case 'c':
++                    *p++ = (char)va_arg(args, int); // Cast to char
++                    break;
++                case 'd':
++                    {
++                        int num = va_arg(args, int);
++                        int divisor = 1;
++                        if (num < 0) {
++                            *p++ = '-';
++                            num = -num;
++                        }
++                        while (num / divisor >= 10) {
++                            divisor *= 10;
++                        }
++                        while (divisor > 0) {
++                            *p++ = '0' + num / divisor;
++                            num %= divisor;
++                            divisor /= 10;
++                        }
++                    }
++                    break;
++                case 's':
++                    {
++                        const char *s = va_arg(args, const char *);
++                        while (*s != '\0') {
++                            *p++ = *s++;
++                        }
++                    }
++                    break;
++                default:
++                    *p++ = *format;
++                    break;
++            }
++	 } else {
++            *p++ = *format;
++        }
++        format++;
++    }
++    *p = '\0';
++    va_end(args);
++}
++
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.h b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.h
+new file mode 100644
+index 0000000..4e89826
+--- /dev/null
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Drivers/serial/uart_string.h
+@@ -0,0 +1,12 @@
++#ifndef UARTSTRING_H
++#define UARTSTRING_H
++
++int my_strlen(const char *str);
++void my_strcpy(char *dest, const char *src);
++void my_memset(void *ptr, int value, int num);
++void my_strncpy(char *dest, const char *src, int n);
++int my_strncmp(const char *s1, const char *s2, int n);
++char *my_strncat(char *dest, const char *src, int n);
++void my_sprintf(char *str, const char *format, ...);
++
++#endif
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Makefile b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Makefile
+index 079a581..85bb747 100644
+--- a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Makefile
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/Makefile
+@@ -11,7 +11,9 @@ CFLAGS = -mcpu=cortex-a72 \
+          -I$(INCLUDEPATH2) \
+          -I$(INCLUDEPATH3) \
+          -I$(INCLUDEPATH4) \
+-         -I$(INCLUDEPATH5)
++         -I$(INCLUDEPATH5) \
++         -I$(INCLUDEPATH6) \
++         -I$(INCLUDEPATH7)
+ BUILTIN_OPS = -fno-builtin-memset
+ ASMFLAGS = -mcpu=cortex-a72
+ 
+@@ -20,6 +22,8 @@ INCLUDEPATH2 ?= ../musl_libc
+ INCLUDEPATH3 ?= ../mmu
+ INCLUDEPATH4 ?= ../../../Source/include
+ INCLUDEPATH5 ?= ../../../Source/portable/GCC/ARM_CA72_64_BIT
++INCLUDEPATH6 ?= ../../../../FreeRTOS_Plus_Cli
++INCLUDEPATH7 ?= Drivers/serial
+ 
+ # From ./src
+ OBJS = build/startup.o 
+@@ -29,6 +33,11 @@ OBJS +=build/interrupt.o
+ OBJS +=build/main.o
+ OBJS +=build/mmu_cfg.o
+ OBJS +=build/uart.o
++OBJS +=build/uart_string.o
++OBJS +=build/Sample-CLI-commands.o
++OBJS +=build/UARTCommandConsole.o
++OBJS +=build/FreeRTOS_CLI.o
++OBJS +=build/serial.o
+ 
+ # From ../mmu
+ OBJS +=build/mmu.o
+@@ -66,10 +75,12 @@ clean :
+ 	rm -rf ./build
+ 	rm -f *.elf
+ 	rm -f *.list
++	rm -f *.img
+ 
+ uart.elf : src/raspberrypi4.ld $(OBJS)
+ 	$(CROSS)gcc -Wl,--build-id=none -std=gnu99 -T src/raspberrypi4.ld -o $@ -ffreestanding -nostdlib --specs=nosys.specs $(BUILTIN_OPS) $(OBJS)
+ 	$(CROSS)objdump -d uart.elf > uart.list
++	$(CROSS)objcopy -O binary uart.elf kernel8.img
+ 
+ build/%.o : src/%.S
+ 	$(CROSS)as $(ASMFLAGS) -c -o $@ $<
+@@ -89,6 +100,12 @@ build/%.o : ../musl_libc/%.c
+ build/%.o : ../../../Source/%.c
+ 	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
+ 
++build/%.o : ../../../../FreeRTOS_Plus_Cli/%.c
++	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
++
++build/%.o : Drivers/serial/%.c
++	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
++
+ build/%.o : ../../../Source/portable/GCC/ARM_CA72_64_BIT/%.c
+ 	$(CROSS)gcc $(CFLAGS)  -c -o $@ $<
+ 
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/FreeRTOSConfig.h b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/FreeRTOSConfig.h
+index 3723299..59cf5fe 100644
+--- a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/FreeRTOSConfig.h
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/FreeRTOSConfig.h
+@@ -36,6 +36,10 @@
+ #define configMINIMAL_STACK_SIZE				( ( unsigned short ) 200 )
+ #define configTOTAL_HEAP_SIZE					( 124 * 1024 )
+ #define configUSE_16_BIT_TICKS					0
++#define configUSE_TRACE_FACILITY                                1
++#define configUSE_STATS_FORMATTING_FUNCTIONS                    2
++#define configSUPPORT_DYNAMIC_ALLOCATION                        1
++
+ #define configIDLE_SHOULD_YIELD					1
+ 
+ #define configUSE_MUTEXES						1
+@@ -46,6 +50,9 @@
+ #define configTIMER_QUEUE_LENGTH				5
+ #define configTIMER_TASK_STACK_DEPTH			( configMINIMAL_STACK_SIZE * 2 )
+ 
++
++#define configCOMMAND_INT_MAX_OUTPUT_SIZE 2096
++
+ /* Set the following definitions to 1 to include the API function, or zero
+ to exclude the API function. */
+ #define INCLUDE_vTaskDelay						1
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/main.c b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/main.c
+index 9f458c8..e24c646 100644
+--- a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/main.c
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/main.c
+@@ -16,65 +16,13 @@
+ void vApplicationMallocFailedHook( void );
+ void vApplicationIdleHook( void );
+ 
+-static inline void io_halt(void)
+-{
+-    asm volatile ("wfi");
+-    return;
+-}
+-/*-----------------------------------------------------------*/
+-
+-void TaskA(void *pvParameters)
+-{
+-    (void) pvParameters;
+-
+-    for( ;; )
+-    {
+-        uart_puts("\r\n");
+-        uart_puthex(xTaskGetTickCount());
+-        uart_puts("\r\n");
+-        vTaskDelay(1000 / portTICK_RATE_MS);
+-    }
+-
+-    return; /* Never reach this line */
+-}
+-
+-/*-----------------------------------------------------------*/
+-
+-TimerHandle_t timer;
+-uint32_t count=0;
+-void interval_func(TimerHandle_t pxTimer)
+-{
+-    (void) pxTimer;
+-    uint8_t buf[2] = {0};
+-    uint32_t len = 0;
+-
+-    len = uart_read_bytes(buf, sizeof(buf) - 1);
+-    if (len)
+-        uart_puts((char *)buf);
+-
+-    return;
+-}
+-/*-----------------------------------------------------------*/
+-
+ void main(void)
+ {
+-    TaskHandle_t task_a;
+-
+-    uart_init();
+-    uart_puts("\r\n****************************\r\n");
+-    uart_puts("\r\n    FreeRTOS UART Sample\r\n");
+-    uart_puts("\r\n  (This sample uses UART2)\r\n");
+-    uart_puts("\r\n****************************\r\n");
+-
+-    xTaskCreate(TaskA, "Task A", 512, NULL, 0x10, &task_a);
++	extern void vUARTCommandConsoleStart( uint16_t usStackSize, UBaseType_t uxPriority );
+ 
+-    timer = xTimerCreate("print_every_10ms",(10 / portTICK_RATE_MS), pdTRUE, (void *)0, interval_func);
+-    if(timer != NULL)
+-    {
+-        xTimerStart(timer, 0);
+-    }
++	vUARTCommandConsoleStart(1024 /* Stack Size */, 7 /* Thread Priority*/ );
+ 
+-    vTaskStartScheduler();
++	vTaskStartScheduler();
+ }
+ /*-----------------------------------------------------------*/
+ 
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/raspberrypi4.ld b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/raspberrypi4.ld
+index 7735d89..e6d0759 100644
+--- a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/raspberrypi4.ld
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/raspberrypi4.ld
+@@ -1,9 +1,7 @@
+-ENTRY(_boot)
+-
+-CODE_BASE   = 0x20000000;
+-DATA_BASE   = 0x20200000;
+-STACK_TOP   = 0x20600000;
+-PT_BASE     = 0x20600000;
++CODE_BASE   = 0x80000;
++DATA_BASE   = 0x400000;
++STACK_TOP   = 0x800000;
++PT_BASE     = 0x800000;
+  
+ SECTIONS
+ {
+diff --git a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/startup.S b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/startup.S
+index 3a72184..7bfa7cb 100644
+--- a/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/startup.S
++++ b/FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/startup.S
+@@ -36,8 +36,8 @@ start_el1:
+     adrp    x1, stack_top
+     mov     sp, x1
+     // configure MMU
+-    ldr     x0, =configure_mmu
+-    blr     x0
++    //ldr     x0, =configure_mmu
++    //blr     x0
+     // clear bss
+     ldr     x1, =__bss_start
+     ldr     w2, =__bss_size
+diff --git a/FreeRTOS/Source/tasks.c b/FreeRTOS/Source/tasks.c
+index f426a6f..d9094ab 100644
+--- a/FreeRTOS/Source/tasks.c
++++ b/FreeRTOS/Source/tasks.c
+@@ -39,6 +39,7 @@ task.h is included from an application file. */
+ #include "task.h"
+ #include "timers.h"
+ #include "stack_macros.h"
++#include "uart_string.h"
+ 
+ /* Lint e9021, e961 and e750 are suppressed as a MISRA exception justified
+ because the MPU ports require MPU_WRAPPERS_INCLUDED_FROM_API_FILE to be defined
+@@ -2443,7 +2444,7 @@ TCB_t *pxTCB;
+ 	TCB_t* pxTCB;
+ 
+ 		/* Task names will be truncated to configMAX_TASK_NAME_LEN - 1 bytes. */
+-		configASSERT( strlen( pcNameToQuery ) < configMAX_TASK_NAME_LEN );
++		configASSERT( my_strlen( pcNameToQuery ) < configMAX_TASK_NAME_LEN );
+ 
+ 		vTaskSuspendAll();
+ 		{
+@@ -4354,11 +4355,11 @@ TCB_t *pxTCB;
+ 	size_t x;
+ 
+ 		/* Start by copying the entire string. */
+-		strcpy( pcBuffer, pcTaskName );
++		my_strcpy( pcBuffer, pcTaskName );
+ 
+ 		/* Pad the end of the string with spaces to ensure columns line up when
+ 		printed out. */
+-		for( x = strlen( pcBuffer ); x < ( size_t ) ( configMAX_TASK_NAME_LEN - 1 ); x++ )
++		for( x = my_strlen( pcBuffer ); x < ( size_t ) ( configMAX_TASK_NAME_LEN - 1 ); x++ )
+ 		{
+ 			pcBuffer[ x ] = ' ';
+ 		}
+@@ -4455,8 +4456,8 @@ TCB_t *pxTCB;
+ 				pcWriteBuffer = prvWriteNameToBuffer( pcWriteBuffer, pxTaskStatusArray[ x ].pcTaskName );
+ 
+ 				/* Write the rest of the string. */
+-				sprintf( pcWriteBuffer, "\t%c\t%u\t%u\t%u\r\n", cStatus, ( unsigned int ) pxTaskStatusArray[ x ].uxCurrentPriority, ( unsigned int ) pxTaskStatusArray[ x ].usStackHighWaterMark, ( unsigned int ) pxTaskStatusArray[ x ].xTaskNumber ); /*lint !e586 sprintf() allowed as this is compiled with many compilers and this is a utility function only - not part of the core kernel implementation. */
+-				pcWriteBuffer += strlen( pcWriteBuffer ); /*lint !e9016 Pointer arithmetic ok on char pointers especially as in this case where it best denotes the intent of the code. */
++				my_sprintf( pcWriteBuffer, "\t%c\t%u\t%u\t%u\r\n", cStatus, ( unsigned int ) pxTaskStatusArray[ x ].uxCurrentPriority, ( unsigned int ) pxTaskStatusArray[ x ].usStackHighWaterMark, ( unsigned int ) pxTaskStatusArray[ x ].xTaskNumber ); /*lint !e586 sprintf() allowed as this is compiled with many compilers and this is a utility function only - not part of the core kernel implementation. */
++				pcWriteBuffer += my_strlen( pcWriteBuffer ); /*lint !e9016 Pointer arithmetic ok on char pointers especially as in this case where it best denotes the intent of the code. */
+ 			}
+ 
+ 			/* Free the array again.  NOTE!  If configSUPPORT_DYNAMIC_ALLOCATION
+@@ -4551,13 +4552,13 @@ TCB_t *pxTCB;
+ 					{
+ 						#ifdef portLU_PRINTF_SPECIFIER_REQUIRED
+ 						{
+-							sprintf( pcWriteBuffer, "\t%lu\t\t%lu%%\r\n", pxTaskStatusArray[ x ].ulRunTimeCounter, ulStatsAsPercentage );
++							my_sprintf( pcWriteBuffer, "\t%lu\t\t%lu%%\r\n", pxTaskStatusArray[ x ].ulRunTimeCounter, ulStatsAsPercentage );
+ 						}
+ 						#else
+ 						{
+ 							/* sizeof( int ) == sizeof( long ) so a smaller
+ 							printf() library can be used. */
+-							sprintf( pcWriteBuffer, "\t%u\t\t%u%%\r\n", ( unsigned int ) pxTaskStatusArray[ x ].ulRunTimeCounter, ( unsigned int ) ulStatsAsPercentage ); /*lint !e586 sprintf() allowed as this is compiled with many compilers and this is a utility function only - not part of the core kernel implementation. */
++							my_sprintf( pcWriteBuffer, "\t%u\t\t%u%%\r\n", ( unsigned int ) pxTaskStatusArray[ x ].ulRunTimeCounter, ( unsigned int ) ulStatsAsPercentage ); /*lint !e586 my_sprintf() allowed as this is compiled with many compilers and this is a utility function only - not part of the core kernel implementation. */
+ 						}
+ 						#endif
+ 					}
+@@ -4567,18 +4568,18 @@ TCB_t *pxTCB;
+ 						consumed less than 1% of the total run time. */
+ 						#ifdef portLU_PRINTF_SPECIFIER_REQUIRED
+ 						{
+-							sprintf( pcWriteBuffer, "\t%lu\t\t<1%%\r\n", pxTaskStatusArray[ x ].ulRunTimeCounter );
++							my_sprintf( pcWriteBuffer, "\t%lu\t\t<1%%\r\n", pxTaskStatusArray[ x ].ulRunTimeCounter );
+ 						}
+ 						#else
+ 						{
+ 							/* sizeof( int ) == sizeof( long ) so a smaller
+ 							printf() library can be used. */
+-							sprintf( pcWriteBuffer, "\t%u\t\t<1%%\r\n", ( unsigned int ) pxTaskStatusArray[ x ].ulRunTimeCounter ); /*lint !e586 sprintf() allowed as this is compiled with many compilers and this is a utility function only - not part of the core kernel implementation. */
++							my_sprintf( pcWriteBuffer, "\t%u\t\t<1%%\r\n", ( unsigned int ) pxTaskStatusArray[ x ].ulRunTimeCounter ); /*lint !e586 my_sprintf() allowed as this is compiled with many compilers and this is a utility function only - not part of the core kernel implementation. */
+ 						}
+ 						#endif
+ 					}
+ 
+-					pcWriteBuffer += strlen( pcWriteBuffer ); /*lint !e9016 Pointer arithmetic ok on char pointers especially as in this case where it best denotes the intent of the code. */
++					pcWriteBuffer += my_strlen( pcWriteBuffer ); /*lint !e9016 Pointer arithmetic ok on char pointers especially as in this case where it best denotes the intent of the code. */
+ 				}
+ 			}
+ 			else
+diff --git a/FreeRTOS_Plus_Cli/FreeRTOS_CLI.c b/FreeRTOS_Plus_Cli/FreeRTOS_CLI.c
+new file mode 100644
+index 0000000..2f92838
+--- /dev/null
++++ b/FreeRTOS_Plus_Cli/FreeRTOS_CLI.c
+@@ -0,0 +1,351 @@
++/*
++ * FreeRTOS+CLI V1.0.4
++ * Copyright (C) 2017 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of
++ * this software and associated documentation files (the "Software"), to deal in
++ * the Software without restriction, including without limitation the rights to
++ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++ * the Software, and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * http://www.FreeRTOS.org
++ * http://aws.amazon.com/freertos
++ *
++ * 1 tab == 4 spaces!
++ */
++
++#include "uart_string.h"
++
++/* FreeRTOS includes. */
++#include "FreeRTOS.h"
++#include "task.h"
++
++/* Utils includes. */
++#include "FreeRTOS_CLI.h"
++
++/* If the application writer needs to place the buffer used by the CLI at a
++fixed address then set configAPPLICATION_PROVIDES_cOutputBuffer to 1 in
++FreeRTOSConfig.h, then declare an array with the following name and size in 
++one of the application files:
++        char cOutputBuffer[ configCOMMAND_INT_MAX_OUTPUT_SIZE ];
++*/
++#ifndef configAPPLICATION_PROVIDES_cOutputBuffer
++        #define configAPPLICATION_PROVIDES_cOutputBuffer 0
++#endif
++
++typedef struct xCOMMAND_INPUT_LIST
++{
++        const CLI_Command_Definition_t *pxCommandLineDefinition;
++        struct xCOMMAND_INPUT_LIST *pxNext;
++} CLI_Definition_List_Item_t;
++
++/*
++ * The callback function that is executed when "help" is entered.  This is the
++ * only default command that is always present.
++ */
++static BaseType_t prvHelpCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++
++/*
++ * Return the number of parameters that follow the command name.
++ */
++static int8_t prvGetNumberOfParameters( const char *pcCommandString );
++
++/* The definition of the "help" command.  This command is always at the front
++of the list of registered commands. */
++static const CLI_Command_Definition_t xHelpCommand =
++{
++        "help",
++        "\r\nhelp:\r\n Lists all the registered commands\r\n\r\n",
++        prvHelpCommand,
++        0
++};
++
++/* The definition of the list of commands.  Commands that are registered are
++added to this list. */
++static CLI_Definition_List_Item_t xRegisteredCommands =
++{
++        &xHelpCommand,  /* The first command in the list is always the help command, defined in this file. */
++        NULL                    /* The next pointer is initialised to NULL, as there are no other registered commands yet. */
++};
++
++/* A buffer into which command outputs can be written is declared here, rather
++than in the command console implementation, to allow multiple command consoles
++to share the same buffer.  For example, an application may allow access to the
++command interpreter by UART and by Ethernet.  Sharing a buffer is done purely
++to save RAM.  Note, however, that the command console itself is not re-entrant,
++so only one command interpreter interface can be used at any one time.  For that
++reason, no attempt at providing mutual exclusion to the cOutputBuffer array is
++attempted.
++
++configAPPLICATION_PROVIDES_cOutputBuffer is provided to allow the application
++writer to provide their own cOutputBuffer declaration in cases where the
++buffer needs to be placed at a fixed address (rather than by the linker). */
++#if( configAPPLICATION_PROVIDES_cOutputBuffer == 0 )
++        static char cOutputBuffer[ configCOMMAND_INT_MAX_OUTPUT_SIZE ];
++#else
++        extern char cOutputBuffer[ configCOMMAND_INT_MAX_OUTPUT_SIZE ];
++#endif
++
++
++/*-----------------------------------------------------------*/
++
++	/*-----------------------------------------------------------*/
++
++BaseType_t FreeRTOS_CLIRegisterCommand( const CLI_Command_Definition_t * const pxCommandToRegister )
++{
++static CLI_Definition_List_Item_t *pxLastCommandInList = &xRegisteredCommands;
++CLI_Definition_List_Item_t *pxNewListItem;
++BaseType_t xReturn = pdFAIL;
++
++        /* Check the parameter is not NULL. */
++        configASSERT( pxCommandToRegister );
++
++        /* Create a new list item that will reference the command being registered. */
++        pxNewListItem = ( CLI_Definition_List_Item_t * ) pvPortMalloc( sizeof( CLI_Definition_List_Item_t ) );
++        configASSERT( pxNewListItem );
++
++        if( pxNewListItem != NULL )
++        {
++                taskENTER_CRITICAL();
++                {
++                        /* Reference the command being registered from the newly created
++                        list item. */
++                        pxNewListItem->pxCommandLineDefinition = pxCommandToRegister;
++
++                        /* The new list item will get added to the end of the list, so
++                        pxNext has nowhere to point. */
++                        pxNewListItem->pxNext = NULL;
++
++                        /* Add the newly created list item to the end of the already existing
++                        list. */
++                        pxLastCommandInList->pxNext = pxNewListItem;
++
++                        /* Set the end of list marker to the new list item. */
++                        pxLastCommandInList = pxNewListItem;
++                }
++                taskEXIT_CRITICAL();
++
++                xReturn = pdPASS;
++        }
++
++        return xReturn;
++}
++/*-----------------------------------------------------------*/
++
++BaseType_t FreeRTOS_CLIProcessCommand( const char * const pcCommandInput, char * pcWriteBuffer, size_t xWriteBufferLen  )
++{
++static const CLI_Definition_List_Item_t *pxCommand = NULL;
++BaseType_t xReturn = pdTRUE;
++const char *pcRegisteredCommandString;
++size_t xCommandStringLength;
++
++        /* Note:  This function is not re-entrant.  It must not be called from more
++        thank one task. */
++
++        if( pxCommand == NULL )
++        {
++                /* Search for the command string in the list of registered commands. */
++                for( pxCommand = &xRegisteredCommands; pxCommand != NULL; pxCommand = pxCommand->pxNext )
++                {
++                        pcRegisteredCommandString = pxCommand->pxCommandLineDefinition->pcCommand;
++                        xCommandStringLength = my_strlen( pcRegisteredCommandString );
++
++                        /* To ensure the string lengths match exactly, so as not to pick up
++                        a sub-string of a longer command, check the byte after the expected
++                        end of the string is either the end of the string or a space before
++                        a parameter. */
++                        if( ( pcCommandInput[ xCommandStringLength ] == ' ' ) || ( pcCommandInput[ xCommandStringLength ] == 0x00 ) )
++                        {
++                                if( my_strncmp( pcCommandInput, pcRegisteredCommandString, xCommandStringLength ) == 0 )
++                                {
++                                        /* The command has been found.  Check it has the expected
++                                        number of parameters.  If cExpectedNumberOfParameters is -1,
++                                        then there could be a variable number of parameters and no
++                                        check is made. */
++                                        if( pxCommand->pxCommandLineDefinition->cExpectedNumberOfParameters >= 0 )
++                                        {
++                                                if( prvGetNumberOfParameters( pcCommandInput ) != pxCommand->pxCommandLineDefinition->cExpectedNumberOfParameters )
++                                                {
++                                                        xReturn = pdFALSE;
++                                                }
++                                        }
++
++                                        break;
++                                }
++                        }
++                }
++        }
++	
++	if( ( pxCommand != NULL ) && ( xReturn == pdFALSE ) )
++        {
++                /* The command was found, but the number of parameters with the command
++                was incorrect. */
++                my_strncpy( pcWriteBuffer, "Incorrect command parameter(s).  Enter \"help\" to view a list of available commands.\r\n\r\n", xWriteBufferLen );
++                pxCommand = NULL;
++        }
++        else if( pxCommand != NULL )
++        {
++                /* Call the callback function that is registered to this command. */
++                xReturn = pxCommand->pxCommandLineDefinition->pxCommandInterpreter( pcWriteBuffer, xWriteBufferLen, pcCommandInput );
++
++                /* If xReturn is pdFALSE, then no further strings will be returned
++                after this one, and     pxCommand can be reset to NULL ready to search
++                for the next entered command. */
++                if( xReturn == pdFALSE )
++                {
++                        pxCommand = NULL;
++                }
++        }
++        else
++        {
++                /* pxCommand was NULL, the command was not found. */
++                my_strncpy( pcWriteBuffer, "Command not recognised.  Enter 'help' to view a list of available commands.\r\n\r\n", xWriteBufferLen );
++                xReturn = pdFALSE;
++        }
++
++        return xReturn;
++}
++/*-----------------------------------------------------------*/
++
++char *FreeRTOS_CLIGetOutputBuffer( void )
++{
++        return cOutputBuffer;
++}
++/*-----------------------------------------------------------*/
++
++const char *FreeRTOS_CLIGetParameter( const char *pcCommandString, UBaseType_t uxWantedParameter, BaseType_t *pxParameterStringLength )
++{
++UBaseType_t uxParametersFound = 0;
++const char *pcReturn = NULL;
++
++        *pxParameterStringLength = 0;
++
++        while( uxParametersFound < uxWantedParameter )
++        {
++                /* Index the character pointer past the current word.  If this is the start
++                of the command string then the first word is the command itself. */
++                while( ( ( *pcCommandString ) != 0x00 ) && ( ( *pcCommandString ) != ' ' ) )
++                {
++                        pcCommandString++;
++                }
++
++                /* Find the start of the next string. */
++                while( ( ( *pcCommandString ) != 0x00 ) && ( ( *pcCommandString ) == ' ' ) )
++                {
++                        pcCommandString++;
++                }
++
++                /* Was a string found? */
++                if( *pcCommandString != 0x00 )
++                {
++                        /* Is this the start of the required parameter? */
++                        uxParametersFound++;
++
++                        if( uxParametersFound == uxWantedParameter )
++                        {
++                                /* How long is the parameter? */
++                                pcReturn = pcCommandString;
++                                while( ( ( *pcCommandString ) != 0x00 ) && ( ( *pcCommandString ) != ' ' ) )
++                                {
++                                        ( *pxParameterStringLength )++;
++                                        pcCommandString++;
++                                }
++
++                                if( *pxParameterStringLength == 0 )
++                                {
++                                        pcReturn = NULL;
++                                }
++
++                                break;
++                        }
++                }
++		else
++                {
++                        break;
++                }
++        }
++
++        return pcReturn;
++}
++/*-----------------------------------------------------------*/
++
++static BaseType_t prvHelpCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString )
++{
++static const CLI_Definition_List_Item_t * pxCommand = NULL;
++BaseType_t xReturn;
++
++        ( void ) pcCommandString;
++
++        if( pxCommand == NULL )
++        {
++                /* Reset the pxCommand pointer back to the start of the list. */
++                pxCommand = &xRegisteredCommands;
++        }
++
++        /* Return the next command help string, before moving the pointer on to
++        the next command in the list. */
++        my_strncpy( pcWriteBuffer, pxCommand->pxCommandLineDefinition->pcHelpString, xWriteBufferLen );
++        pxCommand = pxCommand->pxNext;
++
++        if( pxCommand == NULL )
++        {
++                /* There are no more commands in the list, so there will be no more
++                strings to return after this one and pdFALSE should be returned. */
++                xReturn = pdFALSE;
++        }
++        else
++        {
++                xReturn = pdTRUE;
++        }
++
++        return xReturn;
++}
++/*-----------------------------------------------------------*/
++
++static int8_t prvGetNumberOfParameters( const char *pcCommandString )
++{
++int8_t cParameters = 0;
++BaseType_t xLastCharacterWasSpace = pdFALSE;
++
++        /* Count the number of space delimited words in pcCommandString. */
++        while( *pcCommandString != 0x00 )
++        {
++                if( ( *pcCommandString ) == ' ' )
++                {
++                        if( xLastCharacterWasSpace != pdTRUE )
++                        {
++                                cParameters++;
++                                xLastCharacterWasSpace = pdTRUE;
++                        }
++                }
++                else
++                {
++                        xLastCharacterWasSpace = pdFALSE;
++                }
++
++                pcCommandString++;
++        }
++
++        /* If the command string ended with spaces, then there will have been too
++        many parameters counted. */
++        if( xLastCharacterWasSpace == pdTRUE )
++        {
++                cParameters--;
++        }
++
++        /* The value returned is one less than the number of space delimited words,
++        as the first word should be the command itself. */
++        return cParameters;
++}
++
+diff --git a/FreeRTOS_Plus_Cli/FreeRTOS_CLI.h b/FreeRTOS_Plus_Cli/FreeRTOS_CLI.h
+new file mode 100644
+index 0000000..912ea78
+--- /dev/null
++++ b/FreeRTOS_Plus_Cli/FreeRTOS_CLI.h
+@@ -0,0 +1,92 @@
++/*
++ * FreeRTOS+CLI V1.0.4
++ * Copyright (C) 2017 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of
++ * this software and associated documentation files (the "Software"), to deal in
++ * the Software without restriction, including without limitation the rights to
++ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++ * the Software, and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * http://www.FreeRTOS.org
++ * http://aws.amazon.com/freertos
++ *
++ * 1 tab == 4 spaces!
++ */
++
++#ifndef COMMAND_INTERPRETER_H
++#define COMMAND_INTERPRETER_H
++
++/* The prototype to which callback functions used to process command line
++commands must comply.  pcWriteBuffer is a buffer into which the output from
++executing the command can be written, xWriteBufferLen is the length, in bytes of
++the pcWriteBuffer buffer, and pcCommandString is the entire string as input by
++the user (from which parameters can be extracted).*/
++typedef BaseType_t (*pdCOMMAND_LINE_CALLBACK)( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++
++/* The structure that defines command line commands.  A command line command
++should be defined by declaring a const structure of this type. */
++typedef struct xCOMMAND_LINE_INPUT
++{
++        const char * const pcCommand;                           /* The command that causes pxCommandInterpreter to be executed.  For example "help".  Must be all lower case. */
++        const char * const pcHelpString;                        /* String that describes how to use the command.  Should start with the command itself, and end with "\r\n".  For example "help: Returns a list of all the commands\r\n". */
++        const pdCOMMAND_LINE_CALLBACK pxCommandInterpreter;     /* A pointer to the callback function that will return the output generated by the command. */
++        int8_t cExpectedNumberOfParameters;                     /* Commands expect a fixed number of parameters, which may be zero. */
++} CLI_Command_Definition_t;
++
++/* For backward compatibility. */
++#define xCommandLineInput CLI_Command_Definition_t
++
++/*
++ * Register the command passed in using the pxCommandToRegister parameter.
++ * Registering a command adds the command to the list of commands that are
++ * handled by the command interpreter.  Once a command has been registered it
++ * can be executed from the command line.
++ */
++BaseType_t FreeRTOS_CLIRegisterCommand( const CLI_Command_Definition_t * const pxCommandToRegister );
++
++/*
++ * Runs the command interpreter for the command string "pcCommandInput".  Any
++ * output generated by running the command will be placed into pcWriteBuffer.
++ * xWriteBufferLen must indicate the size, in bytes, of the buffer pointed to
++ * by pcWriteBuffer.
++ *
++ * FreeRTOS_CLIProcessCommand should be called repeatedly until it returns pdFALSE.
++ *
++ * pcCmdIntProcessCommand is not reentrant.  It must not be called from more
++ * than one task - or at least - by more than one task at a time.
++ */
++BaseType_t FreeRTOS_CLIProcessCommand( const char * const pcCommandInput, char * pcWriteBuffer, size_t xWriteBufferLen  );
++
++/*-----------------------------------------------------------*/
++
++/*
++ * A buffer into which command outputs can be written is declared in the
++ * main command interpreter, rather than in the command console implementation,
++ * to allow application that provide access to the command console via multiple
++ * interfaces to share a buffer, and therefore save RAM.  Note, however, that
++ * the command interpreter itself is not re-entrant, so only one command
++ * console interface can be used at any one time.  For that reason, no attempt
++ * is made to provide any mutual exclusion mechanism on the output buffer.
++ *
++ * FreeRTOS_CLIGetOutputBuffer() returns the address of the output buffer.
++ */
++char *FreeRTOS_CLIGetOutputBuffer( void );
++
++/*
++ * Return a pointer to the xParameterNumber'th word in pcCommandString.
++ */
++const char *FreeRTOS_CLIGetParameter( const char *pcCommandString, UBaseType_t uxWantedParameter, BaseType_t *pxParameterStringLength );
++
++#endif /* COMMAND_INTERPRETER_H */
+diff --git a/FreeRTOS_Plus_Cli/Sample-CLI-commands.c b/FreeRTOS_Plus_Cli/Sample-CLI-commands.c
+new file mode 100644
+index 0000000..b038d39
+--- /dev/null
++++ b/FreeRTOS_Plus_Cli/Sample-CLI-commands.c
+@@ -0,0 +1,483 @@
++/*
++ * FreeRTOS Kernel V10.2.1
++ * Copyright (C) 2017 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of
++ * this software and associated documentation files (the "Software"), to deal in
++ * the Software without restriction, including without limitation the rights to
++ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++ * the Software, and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * http://www.FreeRTOS.org
++ * http://aws.amazon.com/freertos
++ *
++ * 1 tab == 4 spaces!
++ */
++
++
++ /******************************************************************************
++ *
++ * http://www.FreeRTOS.org/cli
++ *
++ ******************************************************************************/
++
++#include "uart_string.h"
++
++/* FreeRTOS includes. */
++#include "FreeRTOS.h"
++#include "task.h"
++
++/* Standard includes. */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++
++/* FreeRTOS+CLI includes. */
++#include "FreeRTOS_CLI.h"
++
++#ifndef  configINCLUDE_TRACE_RELATED_CLI_COMMANDS
++        #define configINCLUDE_TRACE_RELATED_CLI_COMMANDS 0
++#endif
++
++#ifndef configINCLUDE_QUERY_HEAP_COMMAND
++        #define configINCLUDE_QUERY_HEAP_COMMAND 0
++#endif
++
++/*
++ * The function that registers the commands that are defined within this file.
++ */
++void vRegisterSampleCLICommands( void );
++
++/*
++ * Implements the task-stats command.
++ */
++static BaseType_t prvTaskStatsCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++
++/*
++ * Implements the run-time-stats command.
++ */
++#if( configGENERATE_RUN_TIME_STATS == 1 )
++        static BaseType_t prvRunTimeStatsCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++#endif /* configGENERATE_RUN_TIME_STATS */
++
++/*
++ * Implements the echo-three-parameters command.
++ */
++static BaseType_t prvThreeParameterEchoCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++
++/*
++ * Implements the echo-parameters command.
++ */
++static BaseType_t prvParameterEchoCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++
++/*
++ * Implements the "query heap" command.
++ */
++#if( configINCLUDE_QUERY_HEAP_COMMAND == 1 )
++        static BaseType_t prvQueryHeapCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++#endif
++
++/*
++ * Implements the "trace start" and "trace stop" commands;
++ */
++#if( configINCLUDE_TRACE_RELATED_CLI_COMMANDS == 1 )
++        static BaseType_t prvStartStopTraceCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString );
++#endif
++
++/* Structure that defines the "task-stats" command line command.  This generates
++a table that gives information on each task in the system. */
++static const CLI_Command_Definition_t xTaskStats =
++{
++        "task-stats", /* The command string to type. */
++        "\r\ntask-stats:\r\n Displays a table showing the state of each FreeRTOS task\r\n",
++        prvTaskStatsCommand, /* The function to run. */
++        0 /* No parameters are expected. */
++};
++
++/* Structure that defines the "echo_3_parameters" command line command.  This
++takes exactly three parameters that the command simply echos back one at a
++time. */
++static const CLI_Command_Definition_t xThreeParameterEcho =
++{
++        "echo-3-parameters",
++        "\r\necho-3-parameters <param1> <param2> <param3>:\r\n Expects three parameters, echos each in turn\r\n",
++        prvThreeParameterEchoCommand, /* The function to run. */
++        3 /* Three parameters are expected, which can take any value. */
++};
++
++/* Structure that defines the "echo_parameters" command line command.  This
++takes a variable number of parameters that the command simply echos back one at
++a time. */
++static const CLI_Command_Definition_t xParameterEcho =
++{
++        "echo-parameters",
++        "\r\necho-parameters <...>:\r\n Take variable number of parameters, echos each in turn\r\n",
++        prvParameterEchoCommand, /* The function to run. */
++        -1 /* The user can enter any number of commands. */
++};
++
++#if( configGENERATE_RUN_TIME_STATS == 1 )
++        /* Structure that defines the "run-time-stats" command line command.   This
++        generates a table that shows how much run time each task has */
++        static const CLI_Command_Definition_t xRunTimeStats =
++        {
++                "run-time-stats", /* The command string to type. */
++                "\r\nrun-time-stats:\r\n Displays a table showing how much processing time each FreeRTOS task has used\r\n",
++                prvRunTimeStatsCommand, /* The function to run. */
++                0 /* No parameters are expected. */
++        };
++#endif /* configGENERATE_RUN_TIME_STATS */
++
++#if( configINCLUDE_QUERY_HEAP_COMMAND == 1 )
++        /* Structure that defines the "query_heap" command line command. */
++        static const CLI_Command_Definition_t xQueryHeap =
++        {
++                "query-heap",
++                "\r\nquery-heap:\r\n Displays the free heap space, and minimum ever free heap space.\r\n",
++                prvQueryHeapCommand, /* The function to run. */
++                0 /* The user can enter any number of commands. */
++        };
++#endif /* configQUERY_HEAP_COMMAND */
++
++#if configINCLUDE_TRACE_RELATED_CLI_COMMANDS == 1
++        /* Structure that defines the "trace" command line command.  This takes a single
++        parameter, which can be either "start" or "stop". */
++        static const CLI_Command_Definition_t xStartStopTrace =
++        {
++                "trace",
++                "\r\ntrace [start | stop]:\r\n Starts or stops a trace recording for viewing in FreeRTOS+Trace\r\n",
++                prvStartStopTraceCommand, /* The function to run. */
++                1 /* One parameter is expected.  Valid values are "start" and "stop". */
++        };
++#endif /* configINCLUDE_TRACE_RELATED_CLI_COMMANDS */
++
++/*-----------------------------------------------------------*/
++
++
++void vRegisterSampleCLICommands( void )
++{
++        /* Register all the command line commands defined immediately above. */
++        FreeRTOS_CLIRegisterCommand( &xTaskStats );
++        FreeRTOS_CLIRegisterCommand( &xThreeParameterEcho );
++        FreeRTOS_CLIRegisterCommand( &xParameterEcho );
++
++        #if( configGENERATE_RUN_TIME_STATS == 1 )
++        {
++                FreeRTOS_CLIRegisterCommand( &xRunTimeStats );
++        }
++        #endif
++
++        #if( configINCLUDE_QUERY_HEAP_COMMAND == 1 )
++        {
++                FreeRTOS_CLIRegisterCommand( &xQueryHeap );
++        }
++        #endif
++
++        #if( configINCLUDE_TRACE_RELATED_CLI_COMMANDS == 1 )
++        {
++                FreeRTOS_CLIRegisterCommand( &xStartStopTrace );
++        }
++        #endif
++}
++/*-----------------------------------------------------------*/
++
++
++static BaseType_t prvTaskStatsCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString )
++{
++const char *const pcHeader = "     State   Priority  Stack    #\r\n****************************************\r\n";
++BaseType_t xSpacePadding;
++
++        /* Remove compile time warnings about unused parameters, and check the
++        write buffer is not NULL.  NOTE - for simplicity, this example assumes the
++        write buffer length is adequate, so does not check for buffer overflows. */
++        ( void ) pcCommandString;
++        ( void ) xWriteBufferLen;
++        configASSERT( pcWriteBuffer );
++
++        /* Generate a table of task stats. */
++        my_strcpy( pcWriteBuffer, "Task" );
++        pcWriteBuffer += my_strlen( pcWriteBuffer );
++
++        /* Minus three for the null terminator and half the number of characters in
++        "Task" so the column lines up with the centre of the heading. */
++        configASSERT( configMAX_TASK_NAME_LEN > 3 );
++        for( xSpacePadding = my_strlen( "Task" ); xSpacePadding < ( configMAX_TASK_NAME_LEN - 3 ); xSpacePadding++ )
++        {
++                /* Add a space to align columns after the task's name. */
++                *pcWriteBuffer = ' ';
++                pcWriteBuffer++;
++
++                /* Ensure always terminated. */
++                *pcWriteBuffer = 0x00;
++        }
++        my_strcpy( pcWriteBuffer, pcHeader );
++        vTaskList( pcWriteBuffer + my_strlen( pcHeader ) );
++
++        /* There is no more data to return after this single string, so return
++        pdFALSE. */
++        return pdFALSE;
++}
++/*-----------------------------------------------------------*/
++
++#if( configINCLUDE_QUERY_HEAP_COMMAND == 1 )
++
++        static BaseType_t prvQueryHeapCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString )
++        {
++                /* Remove compile time warnings about unused parameters, and check the
++                write buffer is not NULL.  NOTE - for simplicity, this example assumes the
++                write buffer length is adequate, so does not check for buffer overflows. */
++                ( void ) pcCommandString;
++                ( void ) xWriteBufferLen;
++                configASSERT( pcWriteBuffer );
++
++                my_sprintf( pcWriteBuffer, "Current free heap %d bytes, minimum ever free heap %d bytes\r\n", ( int ) xPortGetFreeHeapSize(), ( int ) xPortGetMinimumEverFreeHeapSize() );
++
++                /* There is no more data to return after this single string, so return
++                pdFALSE. */
++                return pdFALSE;
++        }
++
++#endif /* configINCLUDE_QUERY_HEAP */
++/*-----------------------------------------------------------*/
++
++
++#if( configGENERATE_RUN_TIME_STATS == 1 )
++
++        static BaseType_t prvRunTimeStatsCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString )
++        {
++        const char * const pcHeader = "  Abs Time      % Time\r\n****************************************\r\n";
++        BaseType_t xSpacePadding;
++
++                /* Remove compile time warnings about unused parameters, and check the
++                write buffer is not NULL.  NOTE - for simplicity, this example assumes the
++                write buffer length is adequate, so does not check for buffer overflows. */
++                ( void ) pcCommandString;
++                ( void ) xWriteBufferLen;
++                configASSERT( pcWriteBuffer );
++
++                /* Generate a table of task stats. */
++                my_strcpy( pcWriteBuffer, "Task" );
++                pcWriteBuffer += my_strlen( pcWriteBuffer );
++
++                /* Pad the string "task" with however many bytes necessary to make it the
++                length of a task name.  Minus three for the null terminator and half the
++                number of characters in "Task" so the column lines up with the centre of
++                the heading. */
++                for( xSpacePadding = my_strlen( "Task" ); xSpacePadding < ( configMAX_TASK_NAME_LEN - 3 ); xSpacePadding++ )
++                {
++                        /* Add a space to align columns after the task's name. */
++                        *pcWriteBuffer = ' ';
++                        pcWriteBuffer++;
++
++                        /* Ensure always terminated. */
++                        *pcWriteBuffer = 0x00;
++                }
++
++                my_strcpy( pcWriteBuffer, pcHeader );
++                vTaskGetRunTimeStats( pcWriteBuffer + my_strlen( pcHeader ) );
++
++                /* There is no more data to return after this single string, so return
++                pdFALSE. */
++                return pdFALSE;
++        }
++
++#endif /* configGENERATE_RUN_TIME_STATS */
++/*-----------------------------------------------------------*/
++
++static BaseType_t prvThreeParameterEchoCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString )
++{
++const char *pcParameter;
++BaseType_t xParameterStringLength, xReturn;
++static UBaseType_t uxParameterNumber = 0;
++
++        /* Remove compile time warnings about unused parameters, and check the
++        write buffer is not NULL.  NOTE - for simplicity, this example assumes the
++        write buffer length is adequate, so does not check for buffer overflows. */
++        ( void ) pcCommandString;
++        ( void ) xWriteBufferLen;
++        configASSERT( pcWriteBuffer );
++
++        if( uxParameterNumber == 0 )
++        {
++                /* The first time the function is called after the command has been
++                entered just a header string is returned. */
++                my_sprintf( pcWriteBuffer, "The three parameters were:\r\n" );
++
++                /* Next time the function is called the first parameter will be echoed
++                back. */
++                uxParameterNumber = 1U;
++
++                /* There is more data to be returned as no parameters have been echoed
++                back yet. */
++                xReturn = pdPASS;
++        }
++	else
++        {
++                /* Obtain the parameter string. */
++                pcParameter = FreeRTOS_CLIGetParameter
++                                                (
++                                                        pcCommandString,                /* The command string itself. */
++                                                        uxParameterNumber,              /* Return the next parameter. */
++                                                        &xParameterStringLength /* Store the parameter string length. */
++                                                );
++
++                /* Sanity check something was returned. */
++                configASSERT( pcParameter );
++
++                /* Return the parameter string. */
++                my_memset( pcWriteBuffer, 0x00, xWriteBufferLen );
++                my_sprintf( pcWriteBuffer, "%d: ", ( int ) uxParameterNumber );
++                my_strncat( pcWriteBuffer, pcParameter, ( size_t ) xParameterStringLength );
++                my_strncat( pcWriteBuffer, "\r\n", my_strlen( "\r\n" ) );
++
++                /* If this is the last of the three parameters then there are no more
++                strings to return after this one. */
++                if( uxParameterNumber == 3U )
++                {
++                        /* If this is the last of the three parameters then there are no more
++                        strings to return after this one. */
++                        xReturn = pdFALSE;
++                        uxParameterNumber = 0;
++                }
++                else
++                {
++                        /* There are more parameters to return after this one. */
++                        xReturn = pdTRUE;
++                        uxParameterNumber++;
++                }
++        }
++
++        return xReturn;
++}
++/*-----------------------------------------------------------*/
++
++static BaseType_t prvParameterEchoCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString )
++{
++const char *pcParameter;
++BaseType_t xParameterStringLength, xReturn;
++static UBaseType_t uxParameterNumber = 0;
++
++        /* Remove compile time warnings about unused parameters, and check the
++        write buffer is not NULL.  NOTE - for simplicity, this example assumes the
++        write buffer length is adequate, so does not check for buffer overflows. */
++        ( void ) pcCommandString;
++        ( void ) xWriteBufferLen;
++        configASSERT( pcWriteBuffer );
++
++        if( uxParameterNumber == 0 )
++        {
++                /* The first time the function is called after the command has been
++                entered just a header string is returned. */
++                my_sprintf( pcWriteBuffer, "The parameters were:\r\n" );
++
++                /* Next time the function is called the first parameter will be echoed
++                back. */
++                uxParameterNumber = 1U;
++
++                /* There is more data to be returned as no parameters have been echoed
++                back yet. */
++                xReturn = pdPASS;
++        }
++	else
++        {
++                /* Obtain the parameter string. */
++                pcParameter = FreeRTOS_CLIGetParameter
++                                                (
++                                                        pcCommandString,                /* The command string itself. */
++                                                        uxParameterNumber,              /* Return the next parameter. */
++                                                        &xParameterStringLength /* Store the parameter string length. */
++                                                );
++
++                if( pcParameter != NULL )
++                {
++                        /* Return the parameter string. */
++                        my_memset( pcWriteBuffer, 0x00, xWriteBufferLen );
++                        my_sprintf( pcWriteBuffer, "%d: ", ( int ) uxParameterNumber );
++                        my_strncat( pcWriteBuffer, ( char * ) pcParameter, ( size_t ) xParameterStringLength );
++                        my_strncat( pcWriteBuffer, "\r\n", my_strlen( "\r\n" ) );
++
++                        /* There might be more parameters to return after this one. */
++                        xReturn = pdTRUE;
++                        uxParameterNumber++;
++                }
++                else
++                {
++                        /* No more parameters were found.  Make sure the write buffer does
++                        not contain a valid string. */
++                        pcWriteBuffer[ 0 ] = 0x00;
++
++                        /* No more data to return. */
++                        xReturn = pdFALSE;
++
++                        /* Start over the next time this command is executed. */
++                        uxParameterNumber = 0;
++                }
++        }
++
++        return xReturn;
++}
++/*-----------------------------------------------------------*/
++
++#if configINCLUDE_TRACE_RELATED_CLI_COMMANDS == 1
++
++        static BaseType_t prvStartStopTraceCommand( char *pcWriteBuffer, size_t xWriteBufferLen, const char *pcCommandString )
++        {
++        const char *pcParameter;
++        BaseType_t lParameterStringLength;
++
++                /* Remove compile time warnings about unused parameters, and check the
++                write buffer is not NULL.  NOTE - for simplicity, this example assumes the
++                write buffer length is adequate, so does not check for buffer overflows. */
++                ( void ) pcCommandString;
++                ( void ) xWriteBufferLen;
++                configASSERT( pcWriteBuffer );
++
++                /* Obtain the parameter string. */
++                pcParameter = FreeRTOS_CLIGetParameter
++                                                (
++                                                        pcCommandString,                /* The command string itself. */
++                                                        1,                                              /* Return the first parameter. */
++                                                        &lParameterStringLength /* Store the parameter string length. */
++                                                );
++
++                /* Sanity check something was returned. */
++                configASSERT( pcParameter );
++
++                /* There are only two valid parameter values. */
++                if( strncmp( pcParameter, "start", my_strlen( "start" ) ) == 0 )
++                {
++                        /* Start or restart the trace. */
++                        vTraceStop();
++                        vTraceClear();
++                        vTraceStart();
++
++                        my_sprintf( pcWriteBuffer, "Trace recording (re)started.\r\n" );
++                }
++		else if( strncmp( pcParameter, "stop", my_strlen( "stop" ) ) == 0 )
++                {
++                        /* End the trace, if one is running. */
++                        vTraceStop();
++                        my_sprintf( pcWriteBuffer, "Stopping trace recording.\r\n" );
++                }
++                else
++                {
++                        my_sprintf( pcWriteBuffer, "Valid parameters are 'start' and 'stop'.\r\n" );
++                }
++
++                /* There is no more data to return after this single string, so return
++                pdFALSE. */
++                return pdFALSE;
++        }
++
++#endif /* configINCLUDE_TRACE_RELATED_CLI_COMMANDS */
+-- 
+2.34.1
+
