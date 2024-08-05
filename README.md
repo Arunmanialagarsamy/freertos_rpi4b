@@ -6,14 +6,6 @@ This repository includes a FreeRTOS UART sample application which can run on Ras
 
 This FreeRTOS porting uses UART2(PL011). The sample application is designed to be launched by u-boot and to operate together with 64-bit Linux.
 
-This implementation is based on another FreeRTOS porting for Raspberry Pi 3 by eggman [1] (many thanks to him!).  
-
-The sample application runs on the CPU core #3 on your Raspberry Pi 4B board. A specified memory region (0x20000000 - 0x207FFFFF) is dedicated to this application. Modify `FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/raspberrypi4.ld` if you want to change the memory usage.
-
-ARMv8-A MMU is available with VA = PA configuration. The current implementation employs 2-level address translation (1GB-page for the 1st level, 2MB-page for the 2nd level). See `FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/mmu.c` for the detail.
-
-[1] https://github.com/eggman/FreeRTOS-raspi3
-
 ## 2. Prerequisites
 
 #### Linux installation
@@ -28,9 +20,7 @@ https://wiki.debian.org/RaspberryPi4
 
 This figure illustrates an expected UART configuration. You need to prepare for two different serial consoles for each UART port dedicated to u-boot/Linux or FreeRTOS.
 
-UART1(mini UART) for u-boot must be configured to use the GPIO ALT5 setting. Add `enable_uart=1` to `config.txt`. See https://www.raspberrypi.org/documentation/configuration/uart.md for the detail.
-
-UART2(PL011) for FreeRTOS is  automatically configured to use the GPIO ALT4 setting in the FreeRTOS UART application. So you do not need to configure the UART port manually.
+Connect uart1 and uart2 debug port.
 
 #### Compiler installation
 
@@ -48,7 +38,7 @@ A pre-built u-boot image provided by Ubuntu or Debian may not have the `dcache` 
 `$ git clone https://github.com/u-boot/u-boot`  
 
 (2) Compilation
-```
+```bash
 $ cd u-boot
 $ export CROSS_COMPILE=aarch64-none-elf-
 $ echo 'CONFIG_CMD_CACHE=y' >> ./configs/rpi_4_defconfig
@@ -58,51 +48,31 @@ $ make -j4 (if your PC has 4 processor cores)
 (`CROSS_COMPILE` must be changed depending on a compiler you installed)
 
 (3) Copy the binary to your SD card  
-```
+```bash
 $ sudo cp ./u-boot.bin /path/to/sd_boot_partition/kernel8.img
 ```
 (The new file name must be `kernel8.img`)
 
 ## 3. FreeRTOS UART sample build
 
-Very simple! Just execute the following commands.
+1. Clone the repository:
+
+```bash
+git clone https://github.com/TImada/raspi4_freertos.git
 ```
+2. Download the patch file `uart1-uboot-uart2-freertos.patch`.
+
+3. Apply the patch:
+   
+```bash
+git apply uart1-uboot-uart2-freertos.patch
+
+```
+4. Navigate to the UART directory:
+   
+```bash
 $ cd Demo/CORTEX_A72_64-bit_Raspberrypi4/uart
-$ make CROSS=aarch64-none-elf-
-```
-(`CROSS` must be changed depending on a compiler you installed)
-
-MMU is enabled by default. You can easily disable it by removing or commenting out the configure_mmu() call.
-```
-(in FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/startup.S)
-...
-start_el1:
-    ...
-    // configure MMU
-    // ldr   x0, =configure_mmu
-    // blr   x0
-    ...
-```
-
-Modify the page table configuration before compiling, if you want to change the memory location.  
-(You must modify i) the linker script file `raspberrypi4.ld` and ii) the device tree overly file `raspi4-rpmsg.dtso` too!)
-```
-(in FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/src/mmu.c)
-
-/* Page table configuration array */
-#define NUM_PT_CONFIGS (5)
-static struct ptc_t pt_config[NUM_PT_CONFIGS] =
-{
-    { /* Code region (Read only) */
-        .addr = 0x20000000ULL,
-        .size = SIZE_2M,
-        .executable = XN_OFF,
-        .sharable = NON_SHARABLE,
-        .permission = READ_WRITE,
-        .policy = TYPE_MEM_CACHE_WB,
-    },
-    ...
-}
+$ make
 ```
 
 ## 4. Launching FreeRTOS by u-boot
@@ -119,168 +89,41 @@ Insert your SD card into your board, then power it on.
 ```
 setenv autostart yes
 dcache off
-ext4load mmc 0:2 0x28000000 /path/to/uart.elf
+fatload mmc 0:1 0x28000000 /path/to/uart.elf
 dcache flush
 bootelf 0x28000000
+go 0x20001788
 ```
 
-`mmc 0:2` in the `ext4load` command execution will vary depending on your SD card configuration. Don't forget to use the `fatload` command if you copied the sample program binary to a FAT partition.
+## Sample Output
 
-You will see output by the UART sample program.
-```
-****************************
-
-    FreeRTOS UART Sample
-
-  (This sample uses UART2)
-
-****************************
-
-00000FF8
-...
-```
-
-## 5. Launching FreeRTOS and Linux
-
-This is little bit complicated. Follow the procedure below.
-
-#### Device tree overlay for FreeRTOS
-
-You have to build a device tree overlay binary file for FreeRTOS. This process should be done on your Raspi4 Ubuntu(Debian) environement.
-
-```
-# Install the dtc command, a device tree compiler
-$ sudo apt-get install device-tree-compiler
-
-# Build a device tree overlay binary file and copy it under /boot/firmware/overlays
-$ cd ./dts
-$ dtc -O dtb -I dts ./raspi4-rpmsg.dtso -o ./raspi4-rpmsg.dtbo 
-$ sudo cp ./raspi4-rpmsg.dtbo /boot/firmware/overlays/
-
-# Add overlay configuration "dtoverlay=raspi4-rpmsg" to the [all] section in config.txt
-$ cat /boot/firmware/config.txt
-...
-...
-
-[all]
-arm_64bit=1
-...
-...
-dtoverlay=raspi4-rpmsg
-```
-
-#### Sample program compilation  
-You need to add a macro `-D__LINUX__` to `CFLAGS` in Makefile. This macro adds a special function to avoid GIC configuration change by Linux.
-
-```
-$ cd Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/
-$ grep ^CFLAGS Makefile
-CFLAGS = -mcpu=cortex-a72 -fpic -ffreestanding -std=gnu99 -O2 -Wall -Wextra -I$(INCLUDEPATH1) -I$(INCLUDEPATH2) -I$(INCLUDEPATH3) -DGUEST -D__LINUX__
-$ make CROSS=aarch64-none-elf-
-```
-(`CROSS` must be changed depending on a compiler you installed)
-
-#### Copy the obtained binary to your SD card  
-
-Same as 4-(1) above.
-
-#### Linux kernel parameter change
-
-Add `maxcpus=3` to `cmdline.txt`. This enables Linux to use only CPU cores #0-2. The CPU core #3 can be used by FreeRTOS safely.
-
-#### Launching FreeRTOS
-Same as 4-(3). Execute the following commands on the u-boot prompt.
-```
-setenv autostart yes
-dcache off
-ext4load mmc 0:2 0x30000000 /path/to/uart.elf
-dcache flush
-bootelf 0x30000000
-dcache on
-```
-But you will see only a message
-```
-Waiting until Linux starts booting up ...
-```
-on UART2(PL011) until you launch Linux.
-
-#### Launching Linux
-
-Quite simple. Just execute
-```
-run bootcmd
-```
-on the u-boot prompt. You will see Linux boot process output on UART1(mini UART) and FreeRTOS UART output on UART2(PL011).
-
-## 6. Debugging
-
-#### On your Raspberry Pi 4B board
-
-(1) Boot Linux, then add `enable_jtag_gpio=1` to `config.txt`.
-
-(2) Reboot your Raspberry Pi 4B board.
-
-#### On your PC for remote debugging
-
-(1) Compile and install the latest OpenOCD (http://openocd.org/repos/).
-
-(2) Download a OpenOCD configuration file for Raspberry Pi 4B from [3] (Many thanks to the author!).
-Then, comment out several lines from the file as shown below.
-
-```
-...
-#   if {$_core != 0} {
-#       set _smp_command "$_smp_command $_TARGETNAME.$_core"
-#   } else {
-#       set _smp_command "target smp $_TARGETNAME.$_core"
-#   }
-...
-}
-
-# eval $_smp_command
-# targets $_TARGETNAME.0
-```
-[3] https://gist.github.com/tnishinaga/46a3380e1f47f5e892bbb74e55b3cf3e
-
-(3) Start the OpenOCD process.
-```
-$ openocd -f /path/to/your_debugger.cfg -f raspi4.cfg
-```
-
-`your_debugger.cfg` varies depending on a debugger you use. It can be found in `tcl/interface/` included in the OpenOCD source directory.
-
-(4) Connect to OpenOCD by gdb.
-```
-$ aarch64-none-elf-gdb /path/to/uart.elf
-
-(on gdb console)
-target remote localhost:3336
-```
-(`aarch64-none-elf-` must be changed depending on a compiler you installed)
-
-You are now ready to start debugging FreeRTOS running on Cortex-A72 core#3. You can add the source code path on the gdb console.
-
-## 7. License
-
-MIT License derived from FreeRTOS. See `LICENSE.md` for the detail.
-```
-./FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/uart/
-./FreeRTOS/Source/
-```
-
-MIT License derived from musl libc(https://musl.libc.org/). See individual files for the detail.
-
-```
-./FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/musl_libc/
-```
-
-GPL-2.0 derived from u-boot(https://github.com/u-boot/u-boot). See individual files for the detail.
-```
-./FreeRTOS/Demo/CORTEX_A72_64-bit_Raspberrypi4/cache/
-```
-
-GPL-2.0 derived from Linux(https://github.com/raspberrypi/linux).
-```
-./dts/
-```
+Hello World !!!                                                                                                                   
+FreeRTOS command server.                                                                                                                                                               
+Type Help to view a list of registered commands.                                                                                                                                       
+                                                                                                                                                                                       
+\> help                                                                                                                                                                                  
+                                                                                                                                                                                       
+help:                                                                                                                                                                                  
+ Lists all the registered commands                                                                                                                                                     
+                                                                                                                                                                                       
+                                                                                                                                                                                       
+task-stats:                                                                                                                                                                            
+ Displays a table showing the state of each FreeRTOS task                                                                                                                              
+                                                                                                                                                                                       
+echo-3-parameters <param1> <param2> <param3>:                                                                                                                                          
+ Expects three parameters, echos each in turn                                                                                                                                          
+                                                                                                                                                                                       
+echo-parameters <...>:                                                                                                                                                                 
+ Take variable number of parameters, echos each in turn                                                                                                                                
+                                                                                                                                                                                       
+task-stats:                                                                                                                                                                            
+ Displays a table showing the state of each FreeRTOS task                                                                                                                              
+                                                                                                                                                                                       
+echo-3-parameters <param1> <param2> <param3>:                                                                                                                                          
+ Expects three parameters, echos each in turn                                                                                                                                          
+                                                                                                                                                                                       
+echo-parameters <...>:                                                                                                                                                                 
+ Take variable number of parameters, echos each in turn                                                                                                                                
+                                                                                                                                                                                       
+[Press ENTER to execute the previous command again]  
 
